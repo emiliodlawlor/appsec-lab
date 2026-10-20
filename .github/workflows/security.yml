@@ -1,0 +1,77 @@
+name: security
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+  workflow_dispatch:   # lets you run it by hand from the Actions tab
+
+# Least-privilege default; jobs that need more ask for it explicitly.
+permissions:
+  contents: read
+
+jobs:
+  sast:
+    name: Semgrep (SAST)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # to upload SARIF to the Security tab
+    container:
+      image: semgrep/semgrep
+    steps:
+      - uses: actions/checkout@v6
+      # semgrep scan runs community rules with no login token needed.
+      # It exits 0 even on findings, so the SARIF always uploads.
+      - run: semgrep scan --config auto --sarif --output=semgrep.sarif
+        continue-on-error: true
+      - name: Upload Semgrep SARIF
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: semgrep.sarif
+          category: semgrep
+
+  sca-and-config:
+    name: Trivy (SCA + IaC + filesystem)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v6
+      # Trivy's action was compromised in 2026 via poisoned version tags.
+      # We pin to the FULL COMMIT SHA of v0.36.0 — a tag can be moved, a SHA cannot.
+      - name: Trivy filesystem scan (dependencies + IaC + secrets)
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          scanners: vuln,misconfig,secret
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL,HIGH
+        env:
+          # Avoids Trivy DB rate-limit flakiness on public runners
+          TRIVY_SKIP_DB_UPDATE: false
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v4
+        if: always()
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
+
+  secrets:
+    name: Gitleaks (secret scanning)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # full history so gitleaks can scan all commits
+      # CLI form — no action, no license question, exits non-zero on a leak.
+      - name: Run Gitleaks
+        run: |
+          docker run --rm -v "$PWD:/repo" ghcr.io/gitleaks/gitleaks:latest \
+            git /repo --redact --verbose --exit-code 1
